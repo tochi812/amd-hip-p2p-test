@@ -24,6 +24,7 @@ if(NOT DEFINED AMDGPU_TARGETS)
     set(AMDGPU_TARGETS "gfx1101;gfx1201" CACHE STRING "AMD GPU targets")
 endif()
 
+find_package(hip REQUIRED CONFIG)
 enable_language(HIP)
 
 add_executable(amd-hip-p2p-test src/main.cpp)

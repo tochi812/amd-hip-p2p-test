@@ -1,0 +1,157 @@
+name: Build HIP P2P Test (Windows ROCm)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup ROCm 7.14
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          New-Item -Path "C:\TheRock\build" -ItemType Directory -Force | Out-Null
+          python -m venv C:\TheRock\build\.venv
+          & C:\TheRock\build\.venv\Scripts\Activate.ps1
+
+          python -m pip install --upgrade pip
+          python -m pip install `
+            --index-url https://repo.amd.com/rocm/whl-multi-arch/ `
+            "rocm[libraries,devel]==7.14.0"
+
+          rocm-sdk init
+          if ($LASTEXITCODE -ne 0) {
+            throw "rocm-sdk init failed"
+          }
+
+      - name: Setup ROCm environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          & C:\TheRock\build\.venv\Scripts\Activate.ps1
+
+          $rocmPath = (rocm-sdk path --root).Trim()
+          $binPath  = (rocm-sdk path --bin).Trim()
+          $clang    = Join-Path $rocmPath "lib\llvm\bin\clang.exe"
+          $clangxx  = Join-Path $rocmPath "lib\llvm\bin\clang++.exe"
+
+          Write-Host "ROCm root : $rocmPath"
+          Write-Host "ROCm bin  : $binPath"
+          Write-Host "HIP clang : $clang"
+
+          if (-not (Test-Path $clang)) {
+            throw "ROCm clang.exe not found: $clang"
+          }
+          if (-not (Test-Path $clangxx)) {
+            throw "ROCm clang++.exe not found: $clangxx"
+          }
+
+          "HIP_PATH=$rocmPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ROCM_PATH=$rocmPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "HIP_PLATFORM=amd" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "HIP_DEVICE_LIB_PATH=$rocmPath\lib\llvm\amdgcn\bitcode" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "LLVM_PATH=$rocmPath\lib\llvm" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          $binPath | Out-File -FilePath $env:GITHUB_PATH -Append
+          "C:\TheRock\build\.venv\Scripts" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $clang   = "${env:HIP_PATH}\lib\llvm\bin\clang.exe"
+          $clangxx = "${env:HIP_PATH}\lib\llvm\bin\clang++.exe"
+
+          cmake -S . -B build `
+            -G "Unix Makefiles" `
+            -DCMAKE_PREFIX_PATH="${env:HIP_PATH}" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER="$clang" `
+            -DCMAKE_CXX_COMPILER="$clangxx" `
+            -DCMAKE_HIP_COMPILER="$clang" `
+            -DHIP_PATH="${env:HIP_PATH}" `
+            "-DAMDGPU_TARGETS=gfx1101;gfx1201"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "CMake configure failed"
+          }
+
+      - name: Verify build configuration
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $cache = "build\CMakeCache.txt"
+          if (-not (Test-Path $cache)) {
+            throw "CMakeCache.txt not found"
+          }
+
+          Write-Host "=== Relevant CMake cache entries ==="
+          Get-Content $cache | Select-String -Pattern "AMDGPU_TARGETS|GPU_TARGETS|CMAKE_HIP_COMPILER"
+
+          $cacheText = Get-Content $cache -Raw
+          if ($cacheText -notmatch "gfx1101") {
+            throw "gfx1101 is missing from CMake configuration"
+          }
+          if ($cacheText -notmatch "gfx1201") {
+            throw "gfx1201 is missing from CMake configuration"
+          }
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          cmake --build build --config Release --parallel 4
+          if ($LASTEXITCODE -ne 0) {
+            throw "Build failed"
+          }
+
+      - name: Verify binary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $exe = Get-ChildItem `
+            -Path build `
+            -Filter "amd-hip-p2p-test.exe" `
+            -Recurse `
+            -ErrorAction SilentlyContinue | Select-Object -First 1
+
+          if (-not $exe) {
+            throw "amd-hip-p2p-test.exe not found"
+          }
+
+          Write-Host "=== Binary ==="
+          $exe | Format-Table FullName, Length
+
+      - name: Prepare artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          New-Item -ItemType Directory -Path output -Force | Out-Null
+
+          Copy-Item "build\amd-hip-p2p-test.exe" "output\" -Force
+          Copy-Item "build\CMakeCache.txt" "output\CMakeCache.txt" -Force
+          Copy-Item "src\main.cpp" "output\main.cpp" -Force
+
+          @(
+            "ROCm: 7.14.0",
+            "AMDGPU_TARGETS: gfx1101;gfx1201"
+          ) | Set-Content "output\BUILD-INFO.txt"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: amd-hip-p2p-test-windows-x64
+          path: output
+          if-no-files-found: error

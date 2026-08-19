@@ -13,103 +13,65 @@ Purpose: Determine whether peer-copy corruption occurs at PCIe/platform, ROCm/HI
 
 ## Usage
 
-Set which GPUs to use before running:
-
 ```powershell
 $env:HIP_VISIBLE_DEVICES = "1,2"
 .\amd-hip-p2p-test.exe
 ```
 
-### Options
-
-| Option | Description |
-|--------|-------------|
-| `--quick` | Reduced sizes and iterations |
-| `--iterations N` | Override stress test iteration count |
-| `--size-mib N` | Override stress/bandwidth test size (MiB) |
-| `--no-bandwidth` | Skip bandwidth measurement |
-
 ## Tests
 
-| Test | Description |
-|------|-------------|
-| **A** Device Information | GPU names, arch, VRAM, PCI info |
-| **B** hipDeviceCanAccessPeer | Bidirectional P2P accessibility |
-| **C** hipDeviceEnablePeerAccess | Bidirectional P2P enable |
-| **D** hipMemcpyPeer correctness | Sync P2P copy, byte-verified |
-| **E** hipMemcpyPeerAsync correctness | Async P2P copy, byte-verified |
-| **F** Host-staged comparison | GPU->Host->GPU without P2P |
-| **G** Stress Test | 100 iterations of async P2P copy |
-| **H** Current Device dependency | Tests effect of current device on P2P |
-| **I** Bandwidth | P2P vs host-staged throughput |
-| **J** Direct peer kernel | SKIPPED (see below) |
+| Test | Description | Runs when canAccess=0? |
+|------|-------------|------------------------|
+| **A** Device Information | GPU names, arch, VRAM, PCI info, runtime/driver version | Yes |
+| **B** hipDeviceCanAccessPeer | Bidirectional P2P accessibility | Yes |
+| **C** hipDeviceEnablePeerAccess | Bidirectional P2P enable | Yes |
+| **D** hipMemcpyPeer correctness | Sync P2P copy, byte-verified | Yes (forced) |
+| **E** hipMemcpyPeerAsync correctness | Async P2P copy, both src+dst stream, byte-verified | Yes (forced) |
+| **F** Host-staged comparison | GPU→Host→GPU without P2P, byte-verified | Yes |
 
-## Test Details
+### Key behavior
 
-### Correctness (D, E, F)
+- **All tests always run**, even when `hipDeviceCanAccessPeer=0`
+- P2P API calls are forced to reproduce the same code path as llama.cpp b10453
+- Test E tries both dst-stream and src-stream (llama.cpp uses src-stream)
+- Every byte is verified via `compareBuffers`
+- Exit code is non-zero if any correctness test fails
 
-Each test runs at sizes: 4 KiB, 1 MiB, 16 MiB, 64 MiB, 256 MiB.
+### Correctness tests (D, E, F)
 
-Two patterns per size:
-1. Sequential (byte = (seed + offset) & 0xFF)
-2. Pseudo-random (xorshift, seed = 0xDEADBEEF)
+Each test runs at 4 MiB with:
+1. Sequential pattern: `byte = (seed + offset) & 0xFF`
+2. Pseudo-random pattern: xorshift, seed = 0xDEADBEEF
 
 On failure, first 10 mismatches are reported with offset, expected, actual.
-
-### Stress (G)
-
-64 MiB x 100 iterations per direction. Each iteration uses a different pseudo-random seed.
-
-### Bandwidth (I)
-
-64 MiB, 5 warmup + 20 timed iterations using hipEvent. Reports:
-- hipMemcpyPeer (sync)
-- hipMemcpyPeerAsync
-- Host staged (GPU->Host->GPU)
 
 ## Interpretation
 
 ### Case 1: hipDeviceCanAccessPeer = NO
 
-P2P not available. Check:
-- PCIe topology
-- BIOS settings (Above 4G, Resizable BAR)
-- Driver version
+Direct P2P memory access not available on this platform.
 
-### Case 2: EnablePeerAccess fails
+If peer copy APIs still fail and host-staged passes → matches llama.cpp `NO_PEER_COPY=ON` behavior.
 
-HIP runtime, driver, or platform issue.
-
-### Case 3: Peer copy = corruption, Host staged = PASS
+### Case 2: Peer copy = data corruption, Host staged = PASS
 
 Strongly suggests peer-transfer-path-specific issue.
 
-### Case 4: Sync = PASS, Async = FAIL
+### Case 3: All tests PASS
 
-Issue in async/stream/runtime path.
-
-### Case 5: Current device affects result
-
-Device/stream management issue.
-
-### Case 6: All HIP tests PASS, llama.cpp fails
-
-Investigate llama.cpp's peer copy usage, scheduler, device management.
-
-## Test J: Direct Peer Kernel Access
-
-SKIPPED. Requires HIP device-side peer pointer access (`__attribute__((address_space(1)))`).
-On Windows ROCm 7.14, the correct implementation is not yet verified.
-Implementing this requires:
-- A minimal HIP kernel that reads/writes peer memory directly
-- Verification that the kernel compiled for both gfx1101 and gfx1201
-- No undefined behavior or spec violations
+Investigate llama.cpp peer copy usage, scheduler, device management.
 
 ## Build
 
-Requires TheRock ROCm 7.14 on Windows. Primary build validation is via GitHub Actions (Windows 2022 runner).
+GitHub Actions workflow is the primary build method. Uses TheRock ROCm 7.14 pip package.
 
 ```powershell
-cmake -S . -B build -G Ninja -DROCM_PATH=<path-to-rocm> -DAMDGPU_TARGETS="gfx1101;gfx1201"
-cmake --build build --config Release
+cmake -S . -B build -G "Unix Makefiles" `
+  -DCMAKE_PREFIX_PATH="$env:HIP_PATH" `
+  -DCMAKE_BUILD_TYPE=Release `
+  -DCMAKE_C_COMPILER="$clang" `
+  -DCMAKE_CXX_COMPILER="$clangxx" `
+  -DCMAKE_HIP_COMPILER="$clang" `
+  -DHIP_PATH="$env:HIP_PATH" `
+  "-DAMDGPU_TARGETS=gfx1101;gfx1201"
 ```
